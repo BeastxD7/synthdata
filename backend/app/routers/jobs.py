@@ -102,7 +102,12 @@ async def stream_job(
                     yield "event: done\ndata: {}\n\n"
                     break
 
-                yield f"event: {event['type']}\ndata: {json.dumps(event['payload'])}\n\n"
+                # Include `stage` in the wire data — without it the client has
+                # no way to tell which pipeline stage emitted the event.
+                yield (
+                    f"event: {event['type']}\n"
+                    f"data: {json.dumps({'stage': event.get('stage'), 'payload': event['payload']})}\n\n"
+                )
         finally:
             runner.unsubscribe(job_id, queue)
 
