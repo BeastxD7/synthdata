@@ -43,6 +43,7 @@ class AuthService:
         await self.db.refresh(user)
 
         access_token, refresh_token = await self._issue_tokens(user)
+        await self.db.commit()
         return user, access_token, refresh_token
 
     async def login(self, email: str, password: str) -> tuple[User, str, str]:
