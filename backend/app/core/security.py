@@ -61,3 +61,18 @@ def encrypt(value: str) -> str:
 
 def decrypt(value: str) -> str:
     return _fernet.decrypt(value.encode()).decode()
+
+
+# --- Provider credential block (dict of secrets) ---
+
+import json as _json
+
+
+def encrypt_credentials(creds: dict) -> str:
+    """Serialize and encrypt a credential dict (e.g. AWS keys) for storage."""
+    return encrypt(_json.dumps(creds, sort_keys=True))
+
+
+def decrypt_credentials(token: str) -> dict:
+    """Reverse of encrypt_credentials. Returns the original dict."""
+    return _json.loads(decrypt(token))

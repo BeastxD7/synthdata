@@ -53,8 +53,15 @@ async def run_job(
     debug_dir: Path | None = None,
     checkpoint_dir: Path | None = None,
     dry_run: bool = False,
+    bedrock_creds: BedrockCredentials | None = None,
 ) -> JobResult:
-    provider = _build_provider(cfg)
+    """Run the full pipeline.
+
+    `bedrock_creds`, when provided, overrides the env-based BedrockCredentials
+    lookup. This is how the backend threads BYOK customer keys into the engine
+    without leaking them into process environment.
+    """
+    provider = _build_provider(cfg, bedrock_creds=bedrock_creds)
     dbg: DebugWriter | None = DebugWriter(debug_dir) if debug_dir else None
 
     # ── Checkpoint: load prior samples and reduce remaining target ──────────
@@ -252,7 +259,7 @@ async def run_job(
 
     # ── Stage 5 — judge (optional) ──────────────────────────────────────────
     await _call(on_stage, "stage5_judge", {"status": "running", "enabled": cfg.judge.enabled})
-    judge_provider = _build_judge_provider(cfg) if cfg.judge.enabled else provider
+    judge_provider = _build_judge_provider(cfg, bedrock_creds=bedrock_creds) if cfg.judge.enabled else provider
     samples, judge_stats = await judge_samples(
         samples, cfg,
         provider=judge_provider,
@@ -392,7 +399,7 @@ async def run_job(
     )
 
 
-def _build_provider(cfg: JobConfig) -> LLMProvider:
+def _build_provider(cfg: JobConfig, *, bedrock_creds: BedrockCredentials | None = None) -> LLMProvider:
     if cfg.provider.type == "ollama":
         if not cfg.provider.model:
             raise ValueError("provider.model is required for ollama")
@@ -402,14 +409,14 @@ def _build_provider(cfg: JobConfig) -> LLMProvider:
             timeout_seconds=cfg.provider.timeout_seconds,
         )
     if cfg.provider.type == "bedrock":
-        creds = BedrockCredentials.from_env()
+        creds = bedrock_creds or BedrockCredentials.from_env()
         if cfg.provider.model:
             creds.model_id = cfg.provider.model
         return BedrockProvider(creds=creds, timeout_seconds=cfg.provider.timeout_seconds)
     raise ValueError(f"unsupported provider: {cfg.provider.type}")
 
 
-def _build_judge_provider(cfg: JobConfig) -> LLMProvider:
+def _build_judge_provider(cfg: JobConfig, *, bedrock_creds: BedrockCredentials | None = None) -> LLMProvider:
     if cfg.provider.type == "ollama":
         return OllamaProvider(
             model=cfg.provider.judge_model or cfg.provider.model or "",
@@ -417,7 +424,13 @@ def _build_judge_provider(cfg: JobConfig) -> LLMProvider:
             timeout_seconds=cfg.provider.timeout_seconds,
         )
     if cfg.provider.type == "bedrock":
-        creds = BedrockCredentials.from_env()
+        # Don't share the same dataclass instance with the main provider —
+        # judge_model would mutate the caller's creds.model_id.
+        if bedrock_creds is not None:
+            from dataclasses import replace
+            creds = replace(bedrock_creds)
+        else:
+            creds = BedrockCredentials.from_env()
         if cfg.provider.judge_model:
             creds.model_id = cfg.provider.judge_model
         elif cfg.provider.model:

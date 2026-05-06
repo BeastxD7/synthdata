@@ -11,10 +11,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
+from ..core.security import decrypt_credentials, encrypt_credentials
 from ..models.job import Job, JobEvent, JobStatus
 from ..models.user import User
 from ..utils.errors import BadRequestError, NotFoundError
 from .credit_service import CreditService
+
+_BEDROCK_CRED_FIELDS = ("aws_access_key_id", "aws_secret_access_key", "aws_region")
 
 
 class JobRunner:
@@ -62,6 +65,11 @@ class JobService:
         target_count = config.get("dataset", {}).get("target_count", 0)
         if target_count <= 0:
             raise BadRequestError("dataset.target_count must be a positive integer")
+
+        # Encrypt provider credentials before persistence. After this call the
+        # snapshot contains a Fernet token under provider.credentials_encrypted
+        # and the plaintext fields are gone.
+        config = _encrypt_provider_credentials(config)
 
         cost_estimate = await self.credit_svc.estimate_job_cost(target_count)
 
@@ -142,22 +150,47 @@ class JobService:
             await db.commit()
 
             seq = 0
+            # Stage 4 fires N parallel generation tasks, each calling emit().
+            # AsyncSession is not concurrency-safe — without this lock, racing
+            # commits raise IllegalStateChangeError and orphan the job at 'running'.
+            emit_lock = asyncio.Lock()
 
             async def emit(event_type: str, stage: str, payload: dict) -> None:
                 nonlocal seq
-                event = JobEvent(
-                    job_id=job_id, sequence=seq, event_type=event_type, stage=stage, payload=payload
-                )
-                db.add(event)
-                await db.commit()
+                async with emit_lock:
+                    event = JobEvent(
+                        job_id=job_id, sequence=seq, event_type=event_type, stage=stage, payload=payload
+                    )
+                    db.add(event)
+                    await db.commit()
+                    seq += 1
                 await runner.broadcast(job_id, {"type": event_type, "stage": stage, "payload": payload})
-                seq += 1
 
             try:
                 from synthdata_engine.config import JobConfig
                 from synthdata_engine.pipeline import run_job
+                from synthdata_engine.providers import BedrockCredentials
 
-                cfg = JobConfig.model_validate(config)
+                # Decrypt creds for this job; they live only in this stack frame
+                # for the duration of the run, never back in the snapshot dict.
+                bedrock_creds = None
+                provider_block = config.get("provider", {})
+                token = provider_block.get("credentials_encrypted")
+                if token and provider_block.get("type") == "bedrock":
+                    plain = decrypt_credentials(token)
+                    bedrock_creds = BedrockCredentials(
+                        access_key_id=plain["aws_access_key_id"],
+                        secret_access_key=plain["aws_secret_access_key"],
+                        region=plain["aws_region"],
+                        model_id=provider_block.get("model") or "",
+                    )
+
+                # Strip the encrypted token before handing to the engine — it
+                # validates against JobConfig which doesn't know that field.
+                engine_config = {**config, "provider": {
+                    k: v for k, v in provider_block.items() if k != "credentials_encrypted"
+                }}
+                cfg = JobConfig.model_validate(engine_config)
 
                 async def on_stage(stage: str, payload: dict) -> None:
                     await emit("stage", stage, payload)
@@ -165,7 +198,12 @@ class JobService:
                 async def on_progress(event: dict) -> None:
                     await emit("progress", "generate", event)
 
-                engine_result = await run_job(cfg, on_stage=on_stage, on_progress=on_progress)
+                engine_result = await run_job(
+                    cfg,
+                    on_stage=on_stage,
+                    on_progress=on_progress,
+                    bedrock_creds=bedrock_creds,
+                )
 
                 output_dir = Path(settings.OUTPUTS_DIR) / str(job_id)
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -197,26 +235,56 @@ class JobService:
                 await runner.broadcast(job_id, {"type": "cancelled", "stage": "cancelled", "payload": {}})
 
             except Exception as exc:
-                job.status = JobStatus.failed
-                job.error_message = str(exc)
-                job.completed_at = datetime.now(timezone.utc)
-                if job.started_at:
-                    job.elapsed_seconds = (job.completed_at - job.started_at).total_seconds()
-
-                credit_svc = CreditService(db)
-                await credit_svc.refund(user, job.credits_reserved, job_id)
-
-                await db.commit()
+                # The shared session may be poisoned (mid-transaction, broken state).
+                # Use a fresh session so the failure write itself can't fail.
+                async with AsyncSessionLocal() as fail_db:
+                    fail_job = (await fail_db.execute(select(Job).where(Job.id == job_id))).scalar_one()
+                    fail_user = (await fail_db.execute(select(User).where(User.id == user_id))).scalar_one()
+                    fail_job.status = JobStatus.failed
+                    fail_job.error_message = str(exc)
+                    fail_job.completed_at = datetime.now(timezone.utc)
+                    if fail_job.started_at:
+                        fail_job.elapsed_seconds = (fail_job.completed_at - fail_job.started_at).total_seconds()
+                    await CreditService(fail_db).refund(fail_user, fail_job.credits_reserved, job_id)
+                    await fail_db.commit()
                 await runner.broadcast(job_id, {"type": "error", "stage": "error", "payload": {"message": str(exc)}})
 
             # Sentinel: tells SSE generator the stream is done (error/cancel paths)
             await runner.broadcast(job_id, None)
 
 
+def _encrypt_provider_credentials(config: dict) -> dict:
+    """Pull AWS keys out of provider block, encrypt as one Fernet token, and
+    rewrite the block. Returns a new dict; does not mutate the input snapshot.
+    Validates required fields up front so misconfigured jobs fail at create
+    time rather than crashing the runner partway through.
+    """
+    provider = dict(config.get("provider") or {})
+    if provider.get("type") != "bedrock":
+        return config
+
+    creds_in = {k: provider.pop(k, None) for k in _BEDROCK_CRED_FIELDS}
+    missing = [k for k, v in creds_in.items() if not v]
+    if missing:
+        raise BadRequestError(
+            f"Bedrock provider requires {', '.join(missing)}"
+        )
+    if not provider.get("model"):
+        raise BadRequestError("Bedrock provider requires 'model' (model ID)")
+
+    provider["credentials_encrypted"] = encrypt_credentials(creds_in)
+    return {**config, "provider": provider}
+
+
 def _write_output(samples: list[dict], path: str, fmt: str) -> None:
     p = Path(path)
     if fmt == "jsonl":
-        p.write_text("\n".join(json.dumps(s, ensure_ascii=False) for s in samples), encoding="utf-8")
+        # Trailing newline so downstream parsers that require LF-terminated
+        # lines (jq -c, some streaming readers) handle the file correctly.
+        body = "\n".join(json.dumps(s, ensure_ascii=False) for s in samples)
+        if body:
+            body += "\n"
+        p.write_text(body, encoding="utf-8")
     elif fmt == "json":
         p.write_text(json.dumps(samples, ensure_ascii=False, indent=2), encoding="utf-8")
     elif fmt == "csv":

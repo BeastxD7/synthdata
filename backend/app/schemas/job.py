@@ -43,10 +43,16 @@ class JobSchemaConfig(BaseModel):
 
 class JobProviderConfig(BaseModel):
     type: Literal["ollama", "bedrock"] = Field(default="ollama")
-    model: str | None = Field(default=None, description="Model ID — optional for bedrock (uses AWS_MODEL_ID env var)")
+    model: str | None = Field(default=None, description="Model ID — required for bedrock")
     concurrency: int = Field(default=5, ge=1, le=50)
     timeout_seconds: int = Field(default=300, ge=5, le=900)
     host: str = Field(default="http://localhost:11434", description="Ollama host URL — ignored for bedrock")
+
+    # BYOK — Bedrock only. Required when type=bedrock. Encrypted at rest before
+    # persistence; never returned in API responses.
+    aws_access_key_id: str | None = Field(default=None, description="AWS access key ID (Bedrock BYOK)")
+    aws_secret_access_key: str | None = Field(default=None, description="AWS secret access key (Bedrock BYOK)")
+    aws_region: str | None = Field(default=None, description="AWS region (Bedrock BYOK)")
 
 
 class JobJudgeConfig(BaseModel):
